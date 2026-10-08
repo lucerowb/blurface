@@ -1276,7 +1276,13 @@ class App:
             f"if {{$::blurface_dy != 0}} {{ {name} yview scroll [expr {{-int($::blurface_dy)}}] units }}"
         )
         self.root.tk.call("bind", "all", "<MouseWheel>", wheel)
-        self.root.tk.call("bind", "all", "<TouchpadScroll>", touch)
+        # The installers ship Tk 8.6, which has no TouchpadScroll event.
+        # Binding it there aborts the app on launch. Tk 9 uses it for trackpads.
+        if self.root.tk.call("info", "commands", "::tk::PreciseScrollDeltas"):
+            try:
+                self.root.tk.call("bind", "all", "<TouchpadScroll>", touch)
+            except tk.TclError:
+                pass
         self.root.tk.call("bind", "all", "<Button-4>", f"{name} yview scroll -48 units")
         self.root.tk.call("bind", "all", "<Button-5>", f"{name} yview scroll 48 units")
 

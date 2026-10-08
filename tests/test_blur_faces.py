@@ -243,21 +243,21 @@ class WindowTests(unittest.TestCase):
             binding = app.root.tk.call("bind", "all", "<MouseWheel>")
             self.assertIn("%D", binding)
             self.assertIn(app.canvas._w, binding)
-            touch = app.root.tk.call("bind", "all", "<TouchpadScroll>")
-            self.assertIn("PreciseScrollDeltas", touch)
-            self.assertIn(app.canvas._w, touch)
+            if app.root.tk.call("info", "commands", "::tk::PreciseScrollDeltas"):
+                touch = app.root.tk.call("bind", "all", "<TouchpadScroll>")
+                self.assertIn("PreciseScrollDeltas", touch)
+                self.assertIn(app.canvas._w, touch)
+                app.canvas.yview_moveto(0.2)
+                before_touch = app.canvas.yview()[0]
+                packed = (-24) & 0xFFFF
+                app.root.tk.eval(touch.replace("%D", str(packed)))
+                self.assertGreater(app.canvas.yview()[0], before_touch)
             app.canvas.yview_moveto(0.2)
             before = app.canvas.yview()[0]
             # A fractional mouse-wheel delta. Python's event.delta would become 0.
             script = binding.replace("%D", "-2.4")
             app.root.tk.eval(script)
             app.root.tk.eval(script)
-            self.assertGreater(app.canvas.yview()[0], before)
-            app.canvas.yview_moveto(0.2)
-            before = app.canvas.yview()[0]
-            # macOS trackpads send <TouchpadScroll> with a packed pixel delta.
-            packed = (-24) & 0xFFFF
-            app.root.tk.eval(touch.replace("%D", str(packed)))
             self.assertGreater(app.canvas.yview()[0], before)
         finally:
             if app is not None:

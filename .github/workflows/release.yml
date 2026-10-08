@@ -2,6 +2,11 @@ name: Build installers
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0.1"
+        required: true
+        type: string
   push:
     tags:
       - "v*"
@@ -53,7 +58,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     needs: [windows, macos]
     runs-on: ubuntu-latest
     permissions:
@@ -65,7 +70,12 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
-          tag="${GITHUB_REF_NAME}"
-          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --notes "Windows exe and macOS dmg. These builds are not notarized."
+          tag="$RELEASE_TAG"
+          case "$tag" in
+            v*) ;;
+            *) echo "Release tag must look like v1.0.1 (got: $tag)" >&2; exit 1 ;;
+          esac
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes "Windows exe and macOS dmg. These builds are not notarized."
           gh release upload "$tag" artifacts/Blurface-windows/Blurface.exe artifacts/Blurface-macos/Blurface.dmg --clobber

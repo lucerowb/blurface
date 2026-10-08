@@ -67,7 +67,7 @@ The window scrolls. The export bar stays pinned at the bottom.
 
 ## Installers
 
-GitHub Actions builds a Windows exe and a macOS dmg when you push a tag such as `v1.0.0`, or when you run the **Build installers** workflow by hand. Download them from the workflow artifacts, or from the GitHub release created for that tag.
+GitHub Actions builds a Windows exe and a macOS dmg when you push a tag such as `v1.0.0`, or when you run **Build installers** by hand and enter that tag. The release is published either way. A manual run with no tag used to skip the release job, because a branch name is not a version.
 
 The builds are not notarized. macOS may ask you to open the app from the context menu the first time.
 
