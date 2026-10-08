@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec
+.venv/
+venv/
+
+# Virtualenv that was created at path/to/venv
+path/
+
+# Downloaded models live in ~/.cache/blurface. Local media stays out of git.
+*.onnx
+*.mp4
+*.mov
+*.m4v
+*.avi
+*.mkv
+
+# Unused detector file from an earlier experiment. The app uses YuNet.
+haarcascade_*.xml
+
+# Editors
+.idea/
+.vscode/
+*.swp

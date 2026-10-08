@@ -1,0 +1,24 @@
+[project]
+name = "blurface"
+version = "1.0.0"
+description = "Blur every face in a video except the people you choose to keep."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Srijan Bajracharya" }]
+keywords = ["video", "privacy", "face-blur", "opencv"]
+dependencies = [
+  "opencv-python>=4.8",
+  "numpy>=1.24",
+  "imageio-ffmpeg>=0.4.9",
+]
+
+[project.scripts]
+blurface = "blur_faces:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["blur_faces"]
