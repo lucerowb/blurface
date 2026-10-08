@@ -59,6 +59,63 @@ class BlurTests(unittest.TestCase):
         self.assertEqual(bf.clip_box((10, 10, 40, 40, 0.9), 100, 100), (10, 10, 40, 40))
         self.assertAlmostEqual(bf.iou((0, 0, 10, 10), (0, 0, 10, 10)), 1.0)
 
+    def test_rejects_objects_that_are_not_faces(self):
+        def row(x, y, w, h, eyes_below=False):
+            eye_y = 0.72 if eyes_below else 0.33
+            mouth_y = 0.34 if eyes_below else 0.75
+            return [
+                x, y, w, h,
+                x + 0.32 * w, y + eye_y * h,
+                x + 0.68 * w, y + (eye_y + 0.02) * h,
+                x + 0.50 * w, y + 0.52 * h,
+                x + 0.38 * w, y + mouth_y * h,
+                x + 0.62 * w, y + (mouth_y + 0.02) * h,
+                0.9,
+            ]
+
+        good_box = (10, 10, 80, 100)
+        self.assertTrue(bf.face_is_plausible(row(*good_box), good_box))
+        wide = (0, 0, 220, 50)
+        self.assertFalse(bf.face_is_plausible(row(*wide), wide))
+        self.assertFalse(bf.face_is_plausible(row(10, 10, 80, 100, eyes_below=True), (10, 10, 80, 100)))
+        self.assertEqual(bf.resolve_shape("Auto", (0, 0, 40, 80)), "Ellipse")
+        self.assertEqual(bf.resolve_shape("Auto", (0, 0, 50, 50)), "Circle")
+        self.assertEqual(bf.resolve_shape("Rectangle", (0, 0, 50, 50)), "Rectangle")
+
+    def test_hand_under_a_face_and_a_teal_object_are_rejected(self):
+        face = (100, 40, 80, 100, 0.93)
+        hand = (110, 180, 90, 70)
+        self.assertTrue(bf.body_false_positive(hand, 0.74, [face]))
+        beside = (320, 50, 80, 100)
+        self.assertFalse(bf.body_false_positive(beside, 0.8, [face]))
+        skin = np.zeros((80, 80, 3), np.uint8)
+        skin[:, :, 0] = 150
+        skin[:, :, 1] = 155
+        skin[:, :, 2] = 110
+        skin = bf.cv2.cvtColor(skin, bf.cv2.COLOR_YCrCb2BGR)
+        self.assertTrue(bf.looks_like_skin(skin, (8, 8, 64, 64)))
+        teal = np.zeros((80, 80, 3), np.uint8)
+        teal[:] = (170, 130, 30)
+        self.assertFalse(bf.looks_like_skin(teal, (8, 8, 64, 64)))
+
+    def test_weak_object_track_is_not_blurred(self):
+        track = type("T", (), {})()
+        track.dets = [type("D", (), {"score": score})() for score in (0.62, 0.64, 0.63)]
+        self.assertFalse(bf.track_should_blur(track, 30))
+        strong = type("T", (), {})()
+        strong.dets = [type("D", (), {"score": 0.95})()]
+        self.assertTrue(bf.track_should_blur(strong, 30))
+
+    def test_blur_fades_outside_the_face(self):
+        frame = np.full((90, 90, 3), 240, np.uint8)
+        before = frame.copy()
+        bf.blur_box(frame, (28, 22, 34, 46), "Black box", 0.2, "Ellipse")
+        self.assertEqual(int(frame[1, 1, 0]), 240)
+        self.assertLess(int(frame[45, 45, 0]), 30)
+        faded = ((frame[:, :, 0] > 30) & (frame[:, :, 0] < 230)).any()
+        self.assertTrue(faded)
+        self.assertFalse(np.array_equal(frame, before))
+
     def test_blur_styles_change_the_face(self):
         frame = np.arange(48 * 48 * 3, dtype=np.uint8).reshape(48, 48, 3)
         boxed = frame.copy()
@@ -183,11 +240,25 @@ class WindowTests(unittest.TestCase):
             app._sync_scrollregion()
             content_h = int(float(app.canvas.cget("scrollregion").split()[3]))
             self.assertGreater(content_h, app.canvas.winfo_height())
-            app.canvas.yview_moveto(0)
-            app._wheel(type("E", (), {"delta": -1, "num": 0})())
-            self.assertGreater(app.canvas.yview()[0], 0)
-            app._wheel(type("E", (), {"delta": 1, "num": 0})())
-            self.assertEqual(app.canvas.yview()[0], 0)
+            binding = app.root.tk.call("bind", "all", "<MouseWheel>")
+            self.assertIn("%D", binding)
+            self.assertIn(app.canvas._w, binding)
+            touch = app.root.tk.call("bind", "all", "<TouchpadScroll>")
+            self.assertIn("PreciseScrollDeltas", touch)
+            self.assertIn(app.canvas._w, touch)
+            app.canvas.yview_moveto(0.2)
+            before = app.canvas.yview()[0]
+            # A fractional mouse-wheel delta. Python's event.delta would become 0.
+            script = binding.replace("%D", "-2.4")
+            app.root.tk.eval(script)
+            app.root.tk.eval(script)
+            self.assertGreater(app.canvas.yview()[0], before)
+            app.canvas.yview_moveto(0.2)
+            before = app.canvas.yview()[0]
+            # macOS trackpads send <TouchpadScroll> with a packed pixel delta.
+            packed = (-24) & 0xFFFF
+            app.root.tk.eval(touch.replace("%D", str(packed)))
+            self.assertGreater(app.canvas.yview()[0], before)
         finally:
             if app is not None:
                 app.on_close()

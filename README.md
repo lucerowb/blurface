@@ -52,7 +52,7 @@ blurface
 | Max | Highest quality export. |
 | 1080p / 720p / 480p | Shrinks the long edge when the source is larger. |
 
-Blur styles are a strong blur, pixelation, or a black box.
+Blur styles are a strong blur, pixelation, or a black box. Blur shape can be Auto, circle, ellipse, or rectangle. Auto uses a circle when the face is square and an ellipse otherwise, and the edge fades into the picture. A hand, phone, or bag under a real face is left alone. Analyze the video again after updating so the stricter detector is used.
 
 ## How it works
 

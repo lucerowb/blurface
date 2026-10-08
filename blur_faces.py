@@ -62,7 +62,7 @@ MODELS = {
 }
 
 EMBED_MIN_PX = 40      # faces smaller than this are not fingerprinted (-> blurred)
-EMBED_MIN_SCORE = 0.6  # low-confidence detections are not fingerprinted
+EMBED_MIN_SCORE = 0.7  # low-confidence detections are not fingerprinted
 LINK_MIN_IOU = 0.15    # min box overlap to link detections into a track
 LINK_MIN_SIM = 0.15    # below this fingerprint similarity, never link (identity swap guard)
 VERIFY_MIN_SIM = 0.20  # a "kept" detection that looks this unlike the kept person is blurred
@@ -147,6 +147,115 @@ class FaceEngine:
 # --------------------------------------------------------------------------
 # Geometry helpers
 # --------------------------------------------------------------------------
+def face_is_plausible(row, box):
+    """Reject hands, phones, and other boxes that only loosely look like a face.
+
+    YuNet always emits five landmarks. A real face has the eyes above the nose
+    and the nose above the mouth, inside a roughly face-shaped box.
+    """
+    if row is None or len(row) < 15 or box is None:
+        return False
+    x, y, w, h = box
+    if w < 20 or h < 20:
+        return False
+    aspect = w / h
+    if aspect < 0.6 or aspect > 1.45:
+        return False
+    pts = [(float(row[4 + 2 * i]), float(row[5 + 2 * i])) for i in range(5)]
+    margin_x, margin_y = 0.25 * w, 0.3 * h
+    for px, py in pts:
+        if px < x - margin_x or px > x + w + margin_x:
+            return False
+        if py < y - margin_y or py > y + h + margin_y:
+            return False
+    right_eye, left_eye, nose, right_mouth, left_mouth = pts
+    eye_y = (right_eye[1] + left_eye[1]) * 0.5
+    mouth_y = (right_mouth[1] + left_mouth[1]) * 0.5
+    if not (eye_y + 0.02 * h < nose[1] < mouth_y - 0.02 * h):
+        return False
+    eye_dist = abs(right_eye[0] - left_eye[0])
+    if eye_dist < 0.15 * w or eye_dist > 0.85 * w:
+        return False
+    if abs(right_eye[1] - left_eye[1]) > 0.35 * h:
+        return False
+    mouth_dist = abs(right_mouth[0] - left_mouth[0])
+    if mouth_dist < 0.1 * w:
+        return False
+    eye_left = min(right_eye[0], left_eye[0])
+    eye_right = max(right_eye[0], left_eye[0])
+    if nose[0] < eye_left - 0.15 * w or nose[0] > eye_right + 0.15 * w:
+        return False
+    span = mouth_y - eye_y
+    if span < 0.18 * h or span > 0.72 * h:
+        return False
+    return True
+
+
+def looks_like_skin(frame, box, min_fraction=0.16):
+    """True when the middle of the box has face-like skin color.
+
+    A phone, bag, or other object fails this. A very confident detection
+    skips the check, so unusual lighting can still keep a real face.
+    """
+    H, W = frame.shape[:2]
+    x, y, w, h = [int(round(v)) for v in box[:4]]
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(W, x + max(w, 1)), min(H, y + max(h, 1))
+    roi = frame[y0:y1, x0:x1]
+    if roi.size == 0:
+        return False
+    rh, rw = roi.shape[:2]
+    ycrcb = cv2.cvtColor(roi, cv2.COLOR_BGR2YCrCb)
+    cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
+    skin = (cr >= 133) & (cr <= 183) & (cb >= 77) & (cb <= 135)
+    mask = np.zeros((rh, rw), np.uint8)
+    cv2.ellipse(
+        mask,
+        (rw // 2, rh // 2),
+        (max(1, int(rw * 0.34)), max(1, int(rh * 0.40))),
+        0, 0, 360, 1, thickness=-1,
+    )
+    area = int(mask.sum())
+    if area < 8:
+        return False
+    return float((skin & (mask > 0)).sum()) / area >= min_fraction
+
+
+def body_false_positive(box, score, faces):
+    """A box on the hands or an object held under a clearer face."""
+    ox, oy, ow, oh = box
+    other_cy = oy + oh * 0.5
+    for fx, fy, fw, fh, face_score in faces:
+        if face_score < 0.82 or score >= face_score:
+            continue
+        overlap = min(fx + fw, ox + ow) - max(fx, ox)
+        if overlap < 0.4 * min(fw, ow):
+            continue
+        if oy < fy + fh * 0.55:
+            continue
+        if other_cy - (fy + fh * 0.5) > 2.2 * fh:
+            continue
+        return True
+    return False
+
+
+def track_should_blur(track, fps):
+    """Keep a track only when it is confident or clearly persistent."""
+    if not track.dets:
+        return False
+    scores = [d.score for d in track.dets]
+    mean = sum(scores) / len(scores)
+    peak = max(scores)
+    seconds = len(scores) / max(float(fps or 1), 1.0)
+    if peak >= 0.9:
+        return True
+    if mean >= 0.8 and seconds >= 0.15:
+        return True
+    if mean >= 0.74 and seconds >= 0.4:
+        return True
+    return False
+
+
 def clip_box(row, W, H):
     x, y, w, h = [float(v) for v in row[:4]]
     x0, y0 = max(0.0, x), max(0.0, y)
@@ -405,6 +514,12 @@ def analyze_video(path, engine, progress, cancel, gap_seconds=1.0):
 
         rows = engine.detect(frame)
         boxes = [clip_box(r, W, H) for r in rows]
+        faces = []
+        for row, box in zip(rows, boxes):
+            if box is None or len(row) < 15 or not face_is_plausible(row, box):
+                continue
+            if float(row[14]) >= 0.82:
+                faces.append((*box, float(row[14])))
         active = [t for t in active if idx - t.last_frame <= gap_frames]
 
         # greedy IoU linking to recently-seen tracks
@@ -429,9 +544,13 @@ def analyze_video(path, engine, progress, cancel, gap_seconds=1.0):
             box = boxes[di]
             if box is None:
                 continue
-            if len(row) < 15:
+            if len(row) < 15 or not face_is_plausible(row, box):
                 continue
             score = float(row[14])
+            if body_false_positive(box, score, faces):
+                continue
+            if score < 0.9 and not looks_like_skin(frame, box):
+                continue
             tr = assigned.get(di)
             emb = None
             eligible = score >= EMBED_MIN_SCORE and min(box[2], box[3]) >= EMBED_MIN_PX
@@ -543,33 +662,98 @@ def compute_blur_boxes(analysis, keep_ids):
     for t in analysis.tracks:
         p = t.person
         if p is not None and p.id in keep_ids:
-            # kept person: still blur any single detection that clearly isn't them
+            # A kept person stays visible. Only a high-confidence face that
+            # clearly is someone else, and is not an object under their face,
+            # is still covered.
+            by_frame = defaultdict(list)
             for d in t.dets:
-                if d.emb is not None and float(d.emb @ p.centroid) < VERIFY_MIN_SIM:
-                    per_frame[d.f].append(d.box)
+                if d.score >= 0.82:
+                    by_frame[d.f].append((d.box, d.score))
+            for d in t.dets:
+                if d.emb is None or d.score < 0.88:
+                    continue
+                if float(d.emb @ p.centroid) >= VERIFY_MIN_SIM:
+                    continue
+                others = [face for face in by_frame[d.f] if face[0] is not d.box]
+                if body_false_positive(d.box, d.score, [(b[0], b[1], b[2], b[3], s) for b, s in others]):
+                    continue
+                per_frame[d.f].append(d.box)
+            continue
+        if not track_should_blur(t, fps):
             continue
         add_track_boxes(per_frame, t.dets, gap_frames, extend)
     return per_frame
 
 
-def blur_box(frame, box, style, pad):
+def resolve_shape(shape, box):
+    if shape and shape != "Auto":
+        return shape
+    w, h = float(box[2]), float(box[3])
+    if h <= 1:
+        return "Ellipse"
+    ratio = w / h
+    if 0.82 <= ratio <= 1.22:
+        return "Circle"
+    return "Ellipse"
+
+
+def _shape_mask(height, width, kind, box, origin, pad):
+    """1 inside the face shape, fading to 0 across the padding outside it."""
+    x, y, w, h = [float(v) for v in box[:4]]
+    ox, oy = origin
+    feather = max(8.0, 0.2 * max(w, h))
+    mask = np.zeros((height, width), np.float32)
+    if kind == "Rectangle":
+        x0 = int(round(x - w * pad * 0.35 - ox))
+        y0 = int(round(y - h * pad * 0.35 - oy))
+        x1 = int(round(x + w + w * pad * 0.35 - ox))
+        y1 = int(round(y + h + h * pad * 0.35 - oy))
+        cv2.rectangle(mask, (x0, y0), (x1, y1), 1.0, thickness=-1)
+    else:
+        cx = x + w / 2.0 - ox
+        cy = y + h / 2.0 - oy
+        if kind == "Circle":
+            radius = 0.5 * max(w, h) * (1.0 + pad * 0.25)
+            axes = (max(1, int(round(radius))), max(1, int(round(radius))))
+        else:
+            axes = (max(1, int(round(w * (0.55 + pad * 0.15)))),
+                    max(1, int(round(h * (0.62 + pad * 0.15)))))
+        cv2.ellipse(mask, (int(round(cx)), int(round(cy))), axes, 0, 0, 360, 1.0, thickness=-1)
+    core = (mask > 0.5).astype(np.uint8)
+    outside = cv2.distanceTransform(((1 - core) * 255).astype(np.uint8), cv2.DIST_L2, 3)
+    alpha = np.clip(1.0 - outside / feather, 0.0, 1.0)
+    alpha[core > 0] = 1.0
+    return alpha
+
+
+def blur_box(frame, box, style, pad, shape="Auto"):
     H, W = frame.shape[:2]
-    x, y, w, h = box
-    px, py = max(8.0, w * pad), max(8.0, h * pad)
-    x0, y0 = max(0, int(x - px)), max(0, int(y - py))
-    x1, y1 = min(W, int(x + w + px)), min(H, int(y + h + py))
+    x, y, w, h = [float(v) for v in box[:4]]
+    kind = resolve_shape(shape, box)
+    feather = max(8.0, 0.2 * max(w, h))
+    reach = max(w, h) * (0.65 + pad) + feather
+    cx, cy = x + w / 2.0, y + h / 2.0
+    x0, y0 = max(0, int(cx - reach)), max(0, int(cy - reach))
+    x1, y1 = min(W, int(cx + reach)), min(H, int(cy + reach))
     if x1 <= x0 or y1 <= y0:
         return
     roi = frame[y0:y1, x0:x1]
     rh, rw = roi.shape[:2]
+    alpha = _shape_mask(rh, rw, kind, box, (x0, y0), pad)
+    if float(alpha.max()) <= 0:
+        return
+    painted = roi.copy()
     if style == "Black box":
-        roi[:] = 0
+        painted[:] = 0
     elif style == "Pixelate":
         small = cv2.resize(roi, (8, 8), interpolation=cv2.INTER_AREA)
-        roi[:] = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
-    else:  # Strong blur
-        sigma = max(rw, rh) / 4.0
-        roi[:] = cv2.GaussianBlur(roi, (0, 0), sigma, borderType=cv2.BORDER_REPLICATE)
+        painted[:] = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
+    else:
+        sigma = max(12.0, max(w, h) / 5.0)
+        painted = cv2.GaussianBlur(roi, (0, 0), sigma, borderType=cv2.BORDER_REPLICATE)
+    a = alpha[:, :, None]
+    blended = painted.astype(np.float32) * a + roi.astype(np.float32) * (1.0 - a)
+    roi[:] = np.clip(blended, 0, 255).astype(np.uint8)
 
 
 # --------------------------------------------------------------------------
@@ -633,7 +817,7 @@ def open_writer(directory, fps, size):
 
 
 def render_video(src, dst, per_frame, style, pad, fps, progress, cancel, total_hint,
-                 crf=CRF_DEFAULT, max_edge=0):
+                 crf=CRF_DEFAULT, max_edge=0, shape="Auto"):
     cap = cv2.VideoCapture(src)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {src}")
@@ -663,7 +847,7 @@ def render_video(src, dst, per_frame, style, pad, fps, progress, cancel, total_h
                 for b in boxes:
                     if sx != 1.0 or sy != 1.0:
                         b = (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy)
-                    blur_box(frame, b, style, pad)
+                    blur_box(frame, b, style, pad, shape)
             writer.write(frame)
             idx += 1
             if idx % 15 == 0:
@@ -743,10 +927,12 @@ class App:
         self.quality_buttons = []
         self.resolution_buttons = []
         self.style_buttons = []
+        self.shape_buttons = []
         self.crf = tk.IntVar(value=CRF_DEFAULT)
         self.max_edge = tk.IntVar(value=0)
         self.out_var = tk.StringVar()
-        self.det_thr = tk.DoubleVar(value=0.5)
+        self.det_thr = tk.DoubleVar(value=0.72)
+        self.shape = tk.StringVar(value="Auto")
         self.strict = tk.DoubleVar(value=0.40)
         self.margin = tk.DoubleVar(value=0.35)
         self.style = tk.StringVar(value="Strong blur")
@@ -864,8 +1050,8 @@ class App:
         cols.columnconfigure(0, weight=1)
         cols.columnconfigure(1, weight=1)
         cols.columnconfigure(2, weight=1)
-        self._setting_column(cols, 0, "Face detection", "Lower catches more faces.",
-                             self.det_thr, 0.30, 0.90)
+        self._setting_column(cols, 0, "Face detection", "Higher ignores hands and objects.",
+                             self.det_thr, 0.45, 0.90)
         self._setting_column(cols, 1, "Same-person strictness", "Higher splits similar people.",
                              self.strict, 0.30, 0.60)
         self._setting_column(cols, 2, "Blur margin", "Extra area around each face.",
@@ -876,6 +1062,15 @@ class App:
         styles = (("Blur", "Strong blur"), ("Pixelate", "Pixelate"), ("Box", "Black box"))
         srow, self.style_buttons = self._choice_buttons(style_row, styles, self.style.set)
         srow.pack(side="left")
+        shape_row = tk.Frame(settings, bg=CARD)
+        shape_row.pack(fill="x", pady=(8, 0))
+        self._text(shape_row, "Blur shape", size=12, bold=True).pack(side="left", padx=(0, 10))
+        shape_choices = (("Auto", "Auto"), ("Circle", "Circle"), ("Ellipse", "Ellipse"),
+                         ("Rectangle", "Rectangle"))
+        shrow, self.shape_buttons = self._choice_buttons(shape_row, shape_choices, self.shape.set)
+        shrow.pack(side="left")
+        self._text(settings, "Auto picks a circle or an ellipse. The edge fades into the picture.",
+                   size=11, fg=MUTED).pack(anchor="w", pady=(6, 0))
 
         actions = tk.Frame(body, bg=BG)
         actions.pack(fill="x", padx=20, pady=(12, 0))
@@ -913,6 +1108,7 @@ class App:
         self.crf.trace_add("write", self._on_output_setting)
         self.max_edge.trace_add("write", self._on_output_setting)
         self.style.trace_add("write", lambda *_: self.sync_choices())
+        self.shape.trace_add("write", lambda *_: self.sync_choices())
         self.out_var.trace_add("write", self._on_path_change)
         self.refresh_sizes()
         self.refresh_people()
@@ -921,9 +1117,7 @@ class App:
         r.bind("<Control-o>", self._shortcut_open)
         r.bind("<Command-Return>", self._shortcut_export)
         r.bind("<Control-Return>", self._shortcut_export)
-        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            r.unbind_all(sequence)
-            r.bind_all(sequence, self._wheel)
+        self._install_mousewheel()
         r.protocol("WM_DELETE_WINDOW", self.on_close)
         self._sync_scrollregion()
 
@@ -1059,8 +1253,37 @@ class App:
         except tk.TclError:
             return
 
+    def _install_mousewheel(self):
+        """Scroll with a mouse wheel or a macOS trackpad.
+
+        Tk 9 sends trackpad movement as <TouchpadScroll>, not <MouseWheel>.
+        Python also turns fractional wheel deltas into 0, so both bindings stay
+        in Tcl. yscrollincrement is one pixel.
+        """
+        self.canvas.configure(yscrollincrement=1)
+        name = self.canvas._w
+        self.root.tk.call("set", "::blurface_wheel", "0.0")
+        wheel = (
+            "set raw %D; "
+            "if {abs($raw) < 20} { set raw [expr {$raw * 16.0}] }; "
+            "set ::blurface_wheel [expr {$::blurface_wheel + (-1.0 * $raw * [tk scaling] * 0.75)}]; "
+            "set step [expr {int($::blurface_wheel)}]; "
+            "set ::blurface_wheel [expr {$::blurface_wheel - $step}]; "
+            f"if {{$step != 0}} {{ {name} yview scroll $step units }}"
+        )
+        touch = (
+            "lassign [tk::PreciseScrollDeltas %D] ::blurface_dx ::blurface_dy; "
+            f"if {{$::blurface_dy != 0}} {{ {name} yview scroll [expr {{-int($::blurface_dy)}}] units }}"
+        )
+        self.root.tk.call("bind", "all", "<MouseWheel>", wheel)
+        self.root.tk.call("bind", "all", "<TouchpadScroll>", touch)
+        self.root.tk.call("bind", "all", "<Button-4>", f"{name} yview scroll -48 units")
+        self.root.tk.call("bind", "all", "<Button-5>", f"{name} yview scroll 48 units")
+
     def _wheel(self, event):
         steps = wheel_steps(getattr(event, "delta", 0), getattr(event, "num", 0))
+        if steps and self.canvas.cget("yscrollincrement"):
+            steps *= 16
         if steps:
             self.canvas.yview_scroll(steps, "units")
         return "break"
@@ -1077,7 +1300,7 @@ class App:
 
     def on_close(self):
         self.cancel.set()
-        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        for sequence in ("<MouseWheel>", "<TouchpadScroll>", "<Button-4>", "<Button-5>"):
             try:
                 self.root.unbind_all(sequence)
             except tk.TclError:
@@ -1122,6 +1345,7 @@ class App:
             (self.quality_buttons, int(round(float(self.crf.get())))),
             (self.resolution_buttons, int(self.max_edge.get())),
             (self.style_buttons, self.style.get()),
+            (self.shape_buttons, self.shape.get()),
         )
         for buttons, current in groups:
             for value, btn in buttons:
@@ -1357,6 +1581,7 @@ class App:
         self.progress["value"] = 0
         ana = self.analysis
         style, pad = self.style.get(), float(self.margin.get())
+        shape = self.shape.get()
         crf, max_edge = int(round(float(self.crf.get()))), int(self.max_edge.get())
 
         def work():
@@ -1366,7 +1591,7 @@ class App:
                 res = render_video(
                     ana.path, dst, per_frame, style, pad, ana.fps,
                     lambda frac, text: self.q.put(("progress", frac, text)),
-                    self.cancel, ana.n_frames, crf=crf, max_edge=max_edge)
+                    self.cancel, ana.n_frames, crf=crf, max_edge=max_edge, shape=shape)
                 self.q.put(("cancelled",) if res is None else ("export_done", dst, res))
             except Exception as exc:
                 traceback.print_exc()
